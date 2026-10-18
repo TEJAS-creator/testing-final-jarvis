@@ -70,16 +70,45 @@ export class ProcessManager {
   }
 
   /**
-   * Stops the active voice listener terminal.
+   * Stops active speech playback and the voice listener.
    */
   public stopVoiceListener(): void {
+    const ws = this.getActiveWorkspace();
+    const pyCmd = this.getPythonCmd();
+    let speakScript = path.join(this.coreDir, "speak.py");
+    if (fs.existsSync(path.join(ws, "speak.py"))) {
+      speakScript = path.join(ws, "speak.py");
+    }
+
+    // 1. Immediately kill speech via python speak.py --stop
+    try {
+      cp.exec(`${pyCmd} "${speakScript}" --stop`, { cwd: ws });
+    } catch {
+      // Ignore
+    }
+
+    // 2. Set emergency stop flag and update status
+    try {
+      fs.writeFileSync(path.join(this.coreDir, "jarvis_stop.flag"), String(Date.now()), "utf-8");
+      fs.writeFileSync(path.join(this.coreDir, "last_status.txt"), "[STOPPED] Jarvis halted by user.", "utf-8");
+      if (ws !== this.coreDir) {
+        fs.writeFileSync(path.join(ws, "jarvis_stop.flag"), String(Date.now()), "utf-8");
+      }
+    } catch {
+      // Ignore
+    }
+
+    // 3. Stop listener terminal if active
+    let hadTerminal = false;
     if (this.listenerTerminal) {
       this.listenerTerminal.dispose();
       this.listenerTerminal = null;
-      vscode.window.showInformationMessage("Jarvis: Voice Listener terminated.");
-    } else {
-      vscode.window.showInformationMessage("Jarvis: Voice Listener is not running.");
+      hadTerminal = true;
     }
+
+    vscode.window.showInformationMessage(
+      hadTerminal ? "Jarvis: Voice Listener terminated and speech halted." : "Jarvis: Speech halted and systems silenced."
+    );
   }
 
   /**

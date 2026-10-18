@@ -39,4 +39,6 @@ antigravity_task.json
 antigravity_log.txt
 antigravity_prompt.txt
 speech_queue.txt
+jarvis_stop.flag
+*.flag
 .jarvis/

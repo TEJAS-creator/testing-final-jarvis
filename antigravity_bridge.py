@@ -62,7 +62,8 @@ def attach_to_default_desktop():
 def find_antigravity_window() -> int | None:
     """
     Scans the default desktop for the Antigravity IDE main top-level window.
-    Matches window process ('antigravity ide.exe') or window title containing 'antigravity'.
+    Strictly matches the Antigravity IDE process ('antigravity ide.exe') while
+    filtering out web browsers (Chrome, Edge, Firefox) whose tabs may contain the word 'Antigravity'.
     """
     attach_to_default_desktop()
     matched_hwnds = []
@@ -88,14 +89,25 @@ def find_antigravity_window() -> int | None:
         except Exception:
             pass
 
-        # Check for Antigravity IDE process or title
-        is_ag_proc = "antigravity" in pname
-        is_ag_title = "antigravity" in title
+        # Strictly exclude web browsers and shell windows that may have 'antigravity' in a tab or title
+        if any(b in pname for b in ["chrome", "firefox", "msedge", "brave", "opera", "electron"]):
+            return True
+
+        # Process name matching (Highest Priority)
+        is_ag_proc = "antigravity" in pname or "codex" in pname
+        # Title matching (Only if process is not excluded)
+        is_ag_title = "antigravity ide" in title or ("antigravity" in title and "jarvis" in title)
 
         if is_ag_proc or is_ag_title:
-            # Top-level window check
             if user32.GetParent(hwnd) == 0:
-                matched_hwnds.append((hwnd, length, title))
+                score = 0
+                if "antigravity ide" in pname:
+                    score += 100
+                elif is_ag_proc:
+                    score += 70
+                if "antigravity ide" in title:
+                    score += 30
+                matched_hwnds.append((hwnd, score, length, title))
         return True
 
     cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(enum_cb)
@@ -104,8 +116,8 @@ def find_antigravity_window() -> int | None:
     if not matched_hwnds:
         return None
 
-    # Prefer window with title mentioning project or longest title
-    matched_hwnds.sort(key=lambda item: item[1], reverse=True)
+    # Prefer highest score, then longest title
+    matched_hwnds.sort(key=lambda item: (item[1], item[2]), reverse=True)
     return matched_hwnds[0][0]
 
 
@@ -195,7 +207,7 @@ def dispatch_prompt_to_antigravity(prompt: str) -> bool:
     # Step 3: Bring window to foreground
     force_foreground_window(hwnd)
     print(f"[antigravity_bridge] Focused Antigravity IDE window (HWND={hwnd}).", file=sys.stderr)
-    time.sleep(0.3)
+    time.sleep(0.5)
 
     # Step 4: Focus agent chat input via Ctrl+L
     # We try PyAutoGUI first if available, with robust User32 fallback
@@ -203,16 +215,16 @@ def dispatch_prompt_to_antigravity(prompt: str) -> bool:
         import pyautogui
         pyautogui.FAILSAFE = False
         pyautogui.hotkey("ctrl", "l")
-        time.sleep(0.35)
+        time.sleep(0.45)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.25)
+        time.sleep(0.35)
         pyautogui.press("enter")
     except Exception as e:
         print(f"[antigravity_bridge] PyAutoGUI fallback to keybd_event: {e}", file=sys.stderr)
         send_key_combo(VK_CONTROL, VK_L)
-        time.sleep(0.35)
+        time.sleep(0.45)
         send_key_combo(VK_CONTROL, VK_V)
-        time.sleep(0.25)
+        time.sleep(0.35)
         send_key_press(VK_RETURN)
 
     print("[antigravity_bridge] Prompt pasted and Enter submitted successfully.", file=sys.stderr)

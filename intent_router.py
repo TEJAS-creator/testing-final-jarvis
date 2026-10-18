@@ -44,6 +44,7 @@ STATUS_CACHE_FILE = os.path.join(JARVIS_CORE_DIR, "last_status.txt")
 CODEBASE_CACHE_FILE = os.path.join(JARVIS_CORE_DIR, "codebase_cache.json")
 ANTIGRAVITY_TASK_FILE = os.path.join(JARVIS_CORE_DIR, "antigravity_task.json")
 ANTIGRAVITY_PROMPT_FILE = os.path.join(JARVIS_CORE_DIR, "antigravity_prompt.txt")
+CONFIRMATION_CACHE_FILE = os.path.join(JARVIS_CORE_DIR, "pending_confirmation.json")
 
 def get_project_context(force_refresh: bool = False) -> str:
     """Scans and caches key project source files to answer codebase questions with zero delay."""
@@ -118,6 +119,8 @@ def get_project_context(force_refresh: bool = False) -> str:
     return summary
 
 ANTIGRAVITY_TRIGGER_KEYWORDS = [
+    "debug", "debug it", "debug this", "debug the code", "debug issue", "debug error",
+    "troubleshoot", "diagnose",
     "bug fix", "fix bug", "code changes", "create app", "modify hud", "theme", "antigravity",
     "solve", "bug", "fix", "error", "repair", "broken", "issue", "crash",
     "generate", "create script", "write script", "make script", "build script",
@@ -141,17 +144,18 @@ def sync_to_clipboard(text: str) -> bool:
             return False
 
 def is_antigravity_intent(transcript: str) -> bool:
-    """Detects whether transcript requires Antigravity code generation, bug fixing, or HUD styling."""
+    """Detects whether transcript requires Antigravity code generation, debugging, bug fixing, or HUD styling."""
     t = transcript.lower()
-    # Explicit exclusions: Git queries, branch operations, commits, pushes are NEVER Antigravity
-    if is_git_query(transcript) or is_branch_creation(transcript) or is_branch_deletion(transcript):
+    # Explicit exclusions: Git queries, branch operations, commits, pushes, and reverts are NEVER Antigravity
+    if is_git_query(transcript) or is_branch_creation(transcript) or is_branch_deletion(transcript) or is_revert_commit(transcript):
         return False
     if any(w in t for w in ["branch", "commit", "push", "git status", "git log", "git remote", "repo"]):
-        if "antigravity" not in t:
+        if not any(k in t for k in ["antigravity", "debug", "troubleshoot", "fix"]):
             return False
 
     # Explicit regex patterns for critical trigger phrases
     patterns = [
+        r'\bdebug(?:\s+it|\s+this|\s+the|\s+code|\s+issue|\s+error|\s+app)?\b',
         r'\bbug\s*fix\b',
         r'\bfix\s*bug\b',
         r'\bcode\s*changes?\b',
@@ -159,6 +163,8 @@ def is_antigravity_intent(transcript: str) -> bool:
         r'\bmodify\s*hud\b',
         r'\btheme\b',
         r'\bantigravity\b',
+        r'\btroubleshoot\b',
+        r'\bdiagnose\b',
     ]
     for p in patterns:
         if re.search(p, t):
@@ -183,48 +189,215 @@ def is_git_query(transcript: str) -> bool:
             return True
     return False
 
+def is_stop_intent(transcript: str) -> bool:
+    """Detects commands to immediately stop speech, cancel, or hush Jarvis.
+    Catches variations and phonetic Whisper transcriptions like 'der hvis stopt', 'jarvis stop', 'be quiet', etc.
+    """
+    if not transcript:
+        return False
+    t = transcript.lower().strip()
+    t = re.sub(r'[^\w\s]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    stop_keywords = [
+        "stop", "stopt", "stopped", "stopping",
+        "quiet", "silence", "hush", "shut up",
+        "cancel", "abort", "halt", "pause speech",
+        "stop talking", "stop speaking"
+    ]
+    words = t.split()
+    if any(k in words for k in ["stop", "stopt", "stopped", "halt", "quiet", "silence", "cancel", "abort"]):
+        return True
+    return any(phrase in t for phrase in stop_keywords)
+
+def check_pending_confirmation(transcript: str) -> dict | None:
+    """Checks if there is an active pending branch confirmation and matches user affirmation or cancellation."""
+    if not os.path.exists(CONFIRMATION_CACHE_FILE):
+        return None
+    try:
+        if time.time() - os.path.getmtime(CONFIRMATION_CACHE_FILE) > 120:
+            os.remove(CONFIRMATION_CACHE_FILE)
+            return None
+        with open(CONFIRMATION_CACHE_FILE, "r", encoding="utf-8") as f:
+            cdata = json.load(f)
+    except Exception:
+        return None
+
+    bname = cdata.get("branch_name", "").strip()
+    target_repo = cdata.get("target_repo", get_target_repo())
+    cd_prefix = f'cd "{target_repo}"'
+
+    clean_t = transcript.lower().strip()
+    clean_norm = re.sub(r"[^\w\s']", " ", clean_t)
+    words = set(re.findall(r"\b[\w']+\b", clean_norm))
+
+    # --- 1. NEGATION & CANCELLATION (Strict Priority) ---
+    # Phrases like "don't remove the branch", "do not delete", "no", "cancel", "stop", "abort", "keep it"
+    no_words = {"no", "nope", "nah", "negative", "cancel", "cancelled", "cancelling", "stop", "abort", "halt", "nevermind", "never", "dont", "don't"}
+    has_no_word = any(w in words for w in no_words)
+
+    no_patterns = [
+        r"\bdon'?t\b",
+        r"\bdo\s+not\b",
+        r"\bnever\b",
+        r"\bno\b",
+        r"\bnope\b",
+        r"\bnah\b",
+        r"\bcancel\b",
+        r"\babort\b",
+        r"\bstop\b",
+        r"\bkeep\b",
+        r"\bleave\b",
+        r"\bnot\s+(?:now|yet|today|ready)\b",
+        r"\b(?:don'?t|do\s+not|never|not)\s+(?:remove|delete|drop|destroy|touch)\b",
+        r"\b(?:keep|leave)\s+(?:it|the\s+branch|this\s+branch|branch)\b",
+    ]
+    is_no = has_no_word or any(bool(re.search(p, clean_t)) for p in no_patterns)
+
+    # --- 2. AFFIRMATION / CONFIRMATION ---
+    # Can ONLY be true if NO negation was detected
+    is_yes = False
+    if not is_no:
+        yes_words = {"yes", "yeah", "yep", "yup", "sure", "proceed", "confirm", "confirmed", "affirmative", "correct"}
+        has_yes_word = any(w in words for w in yes_words)
+
+        yes_patterns = [
+            r"\bgo\s+ahead\b",
+            r"\bdo\s+it\b",
+            r"\byes\s+please\b",
+            r"\byes\s+(?:delete|remove)\b",
+            r"\bconfirm\s+(?:delete|removal|deletion)\b",
+            r"\bplease\s+(?:delete|remove)\b",
+            r"\b(?:delete|remove)\s+(?:it|the\s+branch|this\s+branch)\b",
+            r"^(?:ok|okay|k|sure|fine|delete|remove)$",
+        ]
+        has_yes_pattern = any(bool(re.search(p, clean_t)) for p in yes_patterns)
+        is_yes = has_yes_word or has_yes_pattern
+
+    if is_no:
+        try:
+            if os.path.exists(CONFIRMATION_CACHE_FILE):
+                os.remove(CONFIRMATION_CACHE_FILE)
+        except Exception:
+            pass
+        try:
+            with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as sf:
+                sf.write(f"[CANCELLED] Deletion of branch '{bname}' cancelled by user.")
+        except Exception:
+            pass
+        return {
+            "type": "general_qa",
+            "action": "",
+            "target_file": "",
+            "task_description": "Branch deletion cancelled",
+            "command": "",
+            "speaking_start": "",
+            "speaking_progress": "",
+            "speaking_response": f"Understood, sir. Branch {bname} will not be deleted.",
+        }
+    elif is_yes:
+        try:
+            if os.path.exists(CONFIRMATION_CACHE_FILE):
+                os.remove(CONFIRMATION_CACHE_FILE)
+        except Exception:
+            pass
+        return {
+            "type": "git_action",
+            "action": "delete_branch",
+            "target_file": "",
+            "task_description": f"Delete branch {bname}",
+            "command": f'{cd_prefix} && git branch -D {bname} && git push origin --delete {bname}',
+            "speaking_start": f"Confirmation received. Deleting branch {bname} locally and from GitHub, sir.",
+            "speaking_progress": "",
+            "speaking_response": f"Branch {bname} has been deleted successfully, sir.",
+        }
+
+    return None
+
 def is_branch_deletion(transcript: str) -> bool:
     """Detects git branch deletion requests."""
     t = transcript.lower()
     if is_git_query(transcript):
         return False
+    # If the user explicitly negates the deletion (e.g. "don't delete", "do not remove", "never remove the branch")
+    if re.search(r"\b(?:don'?t|do\s+not|never|not|shouldn'?t)\b.*?\b(?:delete|remove|drop|destroy)\b", t):
+        return False
+    if re.search(r"\b(?:delete|remove|drop|destroy)\b.*?\b(?:not|no|never)\b", t):
+        return False
     patterns = [
         r'\b(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?branch\b',
         r'\bbranch\s+(?:delete|deletion|remove|removal)\b',
+        r'\b(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?[a-zA-Z0-9_\-\.\/\"\']+\s+branch\b',
+        r'\b(?:delete|remove|drop|destroy)\s+branch\s+[a-zA-Z0-9_\-\.\/\"\']+',
     ]
     return any(bool(re.search(p, t)) for p in patterns)
 
-def is_branch_creation(transcript: str) -> bool:
-    """Detects git branch creation requests. Excludes query/question and deletion patterns."""
-    t = transcript.lower()
-    # First, exclude any question or deletion patterns
-    if is_git_query(transcript) or is_branch_deletion(transcript):
+def is_revert_commit(transcript: str) -> bool:
+    """Detects intent to revert or undo last committed changes."""
+    t = transcript.lower().strip()
+    if is_git_query(transcript):
         return False
     patterns = [
-        r'\b(?:create|make|checkout\s+-b|new)\s+(?:a\s+)?branch\b',
-        r'\bbranch\s+(?:called|named)\b',
-        r'\bcreate\s+branch\b',
+        r'\b(?:revert|undo|rollback|roll\s+back)\s+(?:the\s+)?(?:last\s+|latest\s+)?(?:committed\s+)?(?:changes?|commits?|code)\b',
+        r'\b(?:revert|undo|rollback|roll\s+back)\s+(?:the\s+)?(?:last|latest)\s+(?:commit|change)\b',
+        r'\b(?:revert|undo)\s+(?:my\s+)?(?:last\s+)?commit\b',
+        r'\b(?:revert|undo)\s+committed\s+changes?\b',
+        r'\b(?:revert|undo)\s+(?:the\s+)?changes?\b',
+        r'\bundo\s+my\s+changes?\b',
+        r'\bgit\s+revert\b',
+        r'\brollback\s+commit\b',
+    ]
+    if any(bool(re.search(p, t)) for p in patterns):
+        return True
+
+    has_verb = any(w in t for w in ["revert", "undo", "rollback"])
+    has_target = any(w in t for w in ["commit", "committed", "changes", "change"])
+    return has_verb and has_target
+
+def is_branch_creation(transcript: str) -> bool:
+    """Detects git branch creation requests. Excludes query/question, deletion, and repo creation patterns."""
+    t = transcript.lower()
+    if is_git_query(transcript) or is_branch_deletion(transcript) or is_revert_commit(transcript):
+        return False
+    # If transcript is specifically repo creation and doesn't mention branch, it's not branch creation
+    if any(k in t for k in ["repo", "repository"]) and not any(b in t for b in ["branch", "checkout -b"]):
+        return False
+    patterns = [
+        r'\b(?:create|created|creates|creating|make|makes|making|checkout|switch\s+to|new)\s+(?:a\s+)?(?:new\s+)?branch\b',
+        r'\bbranch\s+(?:called|named|as)\b',
+        r'\b(?:create|created)\s+branch\b',
+        r'\bnew\s+branch\b',
+        r'\bcheckout\s+-b\b',
     ]
     return any(bool(re.search(p, t)) for p in patterns)
 
 def extract_branch_name(transcript: str) -> str:
     """Extracts and sanitizes git branch name from user speech.
-    e.g. 'create a branch called jarvis test' -> 'jarvis-test'
-         'delete branch jarvis-test' -> 'jarvis-test'
-         'create branch feature' -> 'feature'
+    e.g. 'created branch "rapport-extension"' -> 'rapport-extension'
+         'create branch feature-login' -> 'feature-login'
+         'create a branch called jarvis test' -> 'jarvis-test'
+         'remove the test branch' -> 'test'
     """
     t = transcript.strip()
     raw = ""
-    # Check deletion commands first
-    m_del = re.search(r'(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?branch\s+(?:called\s+|named\s+)?([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
-    if m_del:
-        raw = m_del.group(1).strip()
+    # Quoted string first
+    m_q = re.search(r'["\']([^"\']+)["\']', t)
+    if m_q and any(w in t.lower() for w in ["branch"]):
+        raw = m_q.group(1).strip()
+
+    if not raw:
+        m_del = re.search(r'(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?branch\s+(?:called\s+|named\s+)?([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
+        if m_del:
+            raw = m_del.group(1).strip()
+    if not raw:
+        m_del_adj = re.search(r'(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?([a-zA-Z0-9_\-\.\/]+)\s+branch', t, re.IGNORECASE)
+        if m_del_adj:
+            raw = m_del_adj.group(1).strip()
     if not raw:
         m = re.search(r'branch\s+(?:called|named|as)\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
         if m:
             raw = m.group(1).strip()
     if not raw:
-        m2 = re.search(r'(?:create|make|checkout|switch to|new)\s+(?:a\s+)?branch\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
+        m2 = re.search(r'(?:create|created|make|checkout|switch to|new)\s+(?:a\s+)?(?:new\s+)?branch\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
         if m2:
             raw = m2.group(1).strip()
     if not raw:
@@ -234,15 +407,10 @@ def extract_branch_name(transcript: str) -> str:
     if not raw:
         raw = "feature-branch"
 
-    # Clean trailing conversational filler words
     raw = re.sub(r'\b(?:please|sir|in|and|push|to github|now|for me|from github)\b.*$', '', raw, flags=re.IGNORECASE).strip()
-    # Strip trailing punctuation (e.g. Whisper sentence-ending periods)
     raw = raw.rstrip('.!?,;: ')
-    # Replace spaces with hyphens (valid git branch naming)
     sanitized = re.sub(r'\s+', '-', raw)
-    # Remove any characters illegal in git branch names
     sanitized = re.sub(r'[^a-zA-Z0-9_\-\.\/]', '', sanitized).lower()
-    # Strip leading/trailing dots, slashes, and hyphens (strictly illegal in Git ref format)
     sanitized = sanitized.strip('.-/')
     sanitized = re.sub(r'\.{2,}', '.', sanitized)
     sanitized = re.sub(r'/{2,}', '/', sanitized)
@@ -304,9 +472,21 @@ def extract_target_file(transcript: str) -> str:
     if any(w in t for w in ["hud", "gui", "theme", "dashboard"]):
         return "jarvis_hud.py"
 
-    if any(w in t for w in ["generate", "create", "write", "build", "new script", "create app"]):
+    if any(w in t for w in ["generate", "create script", "write script", "make script", "build script", "create app"]):
         return "custom_tool.py"
-    return "jarvis_listener.py"
+
+    # Check if last_status mentions a specific python file with an error
+    try:
+        if os.path.exists(STATUS_CACHE_FILE):
+            with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as sf:
+                st = sf.read()
+                mf = re.search(r'([a-zA-Z0-9_\-]+\.py)', st, re.IGNORECASE)
+                if mf:
+                    return mf.group(1).lower()
+    except Exception:
+        pass
+
+    return ""
 
 def build_system_prompt() -> str:
     target_repo = get_target_repo()
@@ -334,15 +514,39 @@ Classify the user's input into one of five types:
    - "What branch am I currently in?" is a git_query, NOT a branch creation.
    - command: the git CLI command to run (e.g. "git branch --show-current", "git status", "git log --oneline -5")
    - speaking_response: A direct spoken answer describing what was found.
-4. "git_action": An INSTRUCTION to perform a Git/GitHub WRITE operation (push, commit, create branch, pr, merge, delete).
-   - CRITICAL: Only classify as git_action when the user is COMMANDING an action, not asking a question.
-   - If user asks to create or make a branch: command MUST be: cd "{target_repo}" && (git checkout -b <branch> 2>nul || git checkout <branch>) && git push -u origin <branch>
+4. "git_action": An INSTRUCTION to perform a Git/GitHub WRITE operation:
+   a. "create_branch": User explicitly requests creating or checking out a branch (e.g. "create branch dev", "created branch feature-auth", "make a branch called test").
+      - action: "create_branch"
+      - command: cd "{target_repo}" && (git checkout -b <branch> 2>nul || git checkout <branch>) && git push -u origin <branch>
+      - speaking_start: "Creating branch <branch>, sir."
+      - speaking_response: "Branch <branch> has been created successfully, sir."
+   b. "create_repo": User requests creating a new GitHub repository (e.g. "create repo my-app", "create a repo called rapport-extension", "create repository api", "create a rapport extension github").
+      - action: "create_repo"
+      - target_file: "<repo_name>"
+      - command: cd "{target_repo}" && gh repo create <repo_name> --public
+      - speaking_start: "Creating new GitHub repository <repo_name>, sir."
+      - speaking_response: "Repository <repo_name> has been created on GitHub successfully, sir."
+   c. "push_code": User requests pushing code to a repository or to GitHub (e.g. "push code to repo rapport-extension", "push code to my-app", "push code", "push all code to github").
+      - action: "push_code"
+      - target_file: "<repo_name_if_specified>"
+      - command: cd "{target_repo}" && git add -A && (git commit -m "Automated update via Jarvis" || echo "No changes to commit") && git push
+      - speaking_start: "Pushing code to repository <repo_name>, sir."
+      - speaking_response: "Code has been pushed to repository <repo_name> successfully, sir."
+   d. "delete_branch": User requests deleting a branch (e.g. "delete branch old-feature").
+      - action: "delete_branch"
+   e. "revert_commit": User requests reverting or undoing committed changes (e.g. "revert the committed changes", "revert the last commit", "undo last commit", "revert commit", "undo committed changes").
+      - action: "revert_commit"
+      - command: cd "{target_repo}" && git revert HEAD --no-edit
+      - speaking_start: "Reverting the last committed changes, sir."
+      - speaking_response: "The last committed changes have been reverted successfully, sir."
 5. "general_qa": General knowledge question, reasoning, conversation, or math.
 
 CRITICAL DISAMBIGUATION RULES:
 - "What branch am I on?" / "Which branch am I currently in?" = git_query (NOT git_action, NOT branch creation)
-- "Create branch feature" / "Make a new branch called dev" = git_action
-- "Push all code to GitHub" = git_action
+- "Create branch <branch>" / "Created branch <branch>" = git_action (action: "create_branch", NEVER create_repo, NEVER push_code)
+- "Create repo <repo>" / "Make a repo <repo>" / "Create <repo> github" = git_action (action: "create_repo", NEVER create_branch)
+- "Push code to repo <repo>" / "Push code" / "Push all code" = git_action (action: "push_code", pushes code to specified repo or current repo)
+- "Revert the committed changes" / "Undo last commit" / "Revert last commit" = git_action (action: "revert_commit", NEVER push_code)
 - "Show me the git status" / "What are my uncommitted changes?" = git_query
 
 You must respond with ONLY a valid, raw JSON object matching the exact schema below.
@@ -351,10 +555,10 @@ DO NOT include markdown code blocks (```json), explanations, or preamble.
 Strict Output Schema:
 {{
   "type": "antigravity_task" | "codebase_qa" | "git_query" | "git_action" | "general_qa",
-  "action": "bug_fix" | "code_generation" | "refactor" | "",
-  "target_file": "<filename_if_antigravity_task>",
-  "task_description": "<detailed_prompt_for_code_fix_if_antigravity>",
-  "command": "<cli_command_if_git>",
+  "action": "bug_fix" | "code_generation" | "refactor" | "create_branch" | "create_repo" | "push_code" | "delete_branch" | "revert_commit" | "",
+  "target_file": "<filename_or_repo_name>",
+  "task_description": "<detailed_prompt>",
+  "command": "<cli_command>",
   "speaking_start": "<short_task_start_announcement>",
   "speaking_progress": "<spoken_progress_announcement_if_antigravity>",
   "speaking_response": "<direct_spoken_answer_2_to_3_sentences_max>"
@@ -372,14 +576,23 @@ Rules:
   - speaking_start: ""
   - speaking_response: will be filled dynamically with the command output
 - For "git_action":
-  - For branch creation (e.g. "create branch feature"):
+  - For branch creation (e.g. "create branch feature" or "created branch dev"):
     command: cd "{target_repo}" && (git checkout -b <branch> 2>nul || git checkout <branch>) && git push -u origin <branch>
-    speaking_start: "Creating and pushing branch <branch> to GitHub, sir."
-    speaking_response: "Branch <branch> has been created and pushed to GitHub, sir."
-  - For commit and push:
-    command: cd "{target_repo}" && git init && git add . && (git commit -m "<msg>" || echo "No changes to commit") && (git push || gh repo create "{proj_name}" --public --source=. --remote=origin --push)
-    speaking_start: "Executing task: committing and pushing your changes, sir."
-    speaking_response: "Task completed successfully, sir."
+    action: "create_branch"
+    speaking_start: "Creating branch <branch>, sir."
+    speaking_response: "Branch <branch> has been created successfully, sir."
+  - For repository creation (e.g. "create repo rapport-extension" or "create a repo called my-app"):
+    command: cd "{target_repo}" && gh repo create <repo_name> --public
+    action: "create_repo"
+    target_file: "<repo_name>"
+    speaking_start: "Creating new GitHub repository <repo_name>, sir."
+    speaking_response: "Repository <repo_name> has been created on GitHub successfully, sir."
+  - For push code (e.g. "push code to repo rapport-extension" or "push code"):
+    command: cd "{target_repo}" && git add -A && (git commit -m "Automated update via Jarvis" || echo "No changes to commit") && git push
+    action: "push_code"
+    target_file: "<repo_name_if_specified>"
+    speaking_start: "Pushing code to repository <repo_name>, sir."
+    speaking_response: "Code has been pushed to repository <repo_name> successfully, sir."
 - For "general_qa":
   - Provide a concise spoken answer (1-2 sentences maximum).
   - command: "", action: "", target_file: "", speaking_start: "", speaking_progress: ""
@@ -390,14 +603,38 @@ Examples:
   "type": "git_action",
   "action": "create_branch",
   "target_file": "",
-  "task_description": "Create and push branch feature",
+  "task_description": "Create branch feature",
   "command": "cd \\"{target_repo}\\" && (git checkout -b feature 2>nul || git checkout feature) && git push -u origin feature",
-  "speaking_start": "Creating and pushing branch feature to GitHub, sir.",
+  "speaking_start": "Creating branch feature, sir.",
   "speaking_progress": "",
-  "speaking_response": "Branch feature has been created and pushed to GitHub, sir."
+  "speaking_response": "Branch feature has been created successfully, sir."
 }}
 
-2. "Jarvis, solve the bug in speak.py" ->
+2. "Jarvis, create repo rapport-extension" ->
+{{
+  "type": "git_action",
+  "action": "create_repo",
+  "target_file": "rapport-extension",
+  "task_description": "Create GitHub repository rapport-extension",
+  "command": "cd \\"{target_repo}\\" && gh repo create rapport-extension --public",
+  "speaking_start": "Creating new GitHub repository rapport-extension, sir.",
+  "speaking_progress": "",
+  "speaking_response": "Repository rapport-extension has been created on GitHub successfully, sir."
+}}
+
+3. "Jarvis, push code to repo rapport-extension" ->
+{{
+  "type": "git_action",
+  "action": "push_code",
+  "target_file": "rapport-extension",
+  "task_description": "Push code to repo rapport-extension",
+  "command": "cd \\"{target_repo}\\" && git add -A && (git commit -m \\"Automated update via Jarvis\\" || echo \\"No changes\\") && git push",
+  "speaking_start": "Pushing code to repository rapport-extension, sir.",
+  "speaking_progress": "",
+  "speaking_response": "Code has been pushed to repository rapport-extension successfully, sir."
+}}
+
+4. "Jarvis, solve the bug in speak.py" ->
 {{
   "type": "antigravity_task",
   "action": "bug_fix",
@@ -503,31 +740,97 @@ def execute_git_query(git_cmd: str, transcript: str) -> str:
 def is_repo_creation(transcript: str) -> bool:
     """Detects intent to create a new GitHub repository."""
     t = transcript.lower()
-    return any(k in t for k in [
-        "new repo", "create repo", "make a repo", "make repo",
-        "new repository", "create repository", "make a repository", "make repository"
-    ])
+    if is_git_query(transcript) or is_branch_deletion(transcript) or is_revert_commit(transcript):
+        return False
+    # If transcript is specifically branch creation and doesn't mention repo, exclude
+    if any(k in t for k in ["branch", "checkout -b"]) and not any(r in t for r in ["repo", "repository"]):
+        return False
+    direct_keywords = [
+        "create repo", "created repo", "create a repo", "created a repo",
+        "make repo", "make a repo", "make a new repo", "new repo",
+        "create repository", "created repository", "create a repository",
+        "make repository", "make a repository", "new repository"
+    ]
+    if any(k in t for k in direct_keywords):
+        return True
+    patterns = [
+        r'\b(?:create|created|creates|make|makes|new|init|initialize)\s+(?:a\s+)?(?:new\s+)?(?:github\s+)?(?:repo|repository)\b',
+        r'\b(?:repo|repository)\s+(?:called|named|as)\b',
+        r'\b(?:create|created|make)\s+(?:a\s+)?(?:new\s+)?([a-zA-Z0-9_\-\s]+?)\s+(?:github\s+)?(?:repo|repository)\b',
+        r'\b(?:create|created|make)\s+(?:a\s+)?([a-zA-Z0-9_\-\s]+?)\s+github\b',
+    ]
+    return any(bool(re.search(p, t)) for p in patterns)
+
+def is_push_code(transcript: str) -> bool:
+    """Detects intent to push code to a repository or GitHub."""
+    t = transcript.lower()
+    if is_git_query(transcript) or is_branch_deletion(transcript) or is_revert_commit(transcript):
+        return False
+    patterns = [
+        r'\bpush\s+(?:all\s+)?(?:the\s+)?(?:my\s+)?(?:code|changes|files|commits?)\b',
+        r'\bpush\s+(?:code\s+)?to\s+(?:the\s+)?(?:repo|repository|github)\b',
+        r'\bpush\s+to\s+(?:repo|repository)\b',
+        r'\bpush\s+(?:code\s+)?to\s+([a-zA-Z0-9_\-\.]+)',
+        r'\bcommit\s+and\s+push\b',
+        r'\bpush\s+code\b',
+        r'\bpush\s+changes\b',
+        r'\bpush\s+to\s+github\b',
+    ]
+    return any(bool(re.search(p, t)) for p in patterns)
 
 def extract_repo_name(t: str, default: str = "project-repo") -> str:
     """Extracts desired repository name from transcript or command string."""
     if not t:
         return default
-    m = re.search(r'(?:named|called)\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:and|to|files|file|repo|repository|please)|\.|$)', t, re.IGNORECASE)
-    if m:
-        cand = m.group(1).strip()
+    text = t.strip()
+
+    # 1. Quoted string
+    m_quoted = re.search(r'["\']([^"\']+)["\']', text)
+    if m_quoted:
+        cand = m_quoted.group(1).strip()
         clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', cand).strip('-')
         clean = re.sub(r'-+', '-', clean)
-        clean = re.sub(r'-(?:and|push|to|files)$', '', clean, flags=re.IGNORECASE).strip('-')
-        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push']:
+        if clean and clean.lower() not in ['repo', 'repository', 'github', 'branch']:
             return clean
 
-    m2 = re.search(r'(?:new\s+)?(?:repo|repository)\s+(?:to\s+push\s+)?([a-zA-Z0-9_\-\s]+?)(?:\s+(?:files|file|and|to|please)|\.|$)', t, re.IGNORECASE)
-    if m2:
-        cand = m2.group(1).strip()
+    # 2. 'named <name>', 'called <name>'
+    m_named = re.search(r'(?:named|called|as)\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:and|to|files?|on|in|please|sir)|\.|$)', text, re.IGNORECASE)
+    if m_named:
+        cand = m_named.group(1).strip()
+        cand = re.sub(r'\s+(?:repo|repository|github|files?|and|please|sir)$', '', cand, flags=re.IGNORECASE).strip()
         clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', cand).strip('-')
         clean = re.sub(r'-+', '-', clean)
-        clean = re.sub(r'-(?:and|push|to|files)$', '', clean, flags=re.IGNORECASE).strip('-')
-        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push', 'and-push']:
+        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push', 'repo', 'repository']:
+            return clean
+
+    # 3. 'push code to (?:repo|repository)? <name>'
+    m_push = re.search(r'push\s+(?:code|changes|files?)?\s*(?:to\s+)?(?:repo|repository)?\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:on|in|please|sir)|\.|$)', text, re.IGNORECASE)
+    if m_push:
+        cand = m_push.group(1).strip()
+        cand = re.sub(r'^(?:repo|repository|to)\s+', '', cand, flags=re.IGNORECASE).strip()
+        cand = re.sub(r'\s+(?:repo|repository|github|files?|and|please|sir)$', '', cand, flags=re.IGNORECASE).strip()
+        clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', cand).strip('-')
+        clean = re.sub(r'-+', '-', clean)
+        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push', 'repo', 'repository', 'github', 'origin']:
+            return clean
+
+    # 4. '(?:create|new|make)\s+(?:a\s+)?(?:new\s+)?(?:github\s+)?(?:repo|repository)\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:and|files?|on|in|to|please|sir)|\.|$)'
+    m_repo = re.search(r'(?:create|created|make|new|init)\s+(?:a\s+)?(?:new\s+)?(?:github\s+)?(?:repo|repository)\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:and|files?|on|in|to|please|sir)|\.|$)', text, re.IGNORECASE)
+    if m_repo:
+        cand = m_repo.group(1).strip()
+        cand = re.sub(r'\s+(?:repo|repository|github|files?|and|please|sir)$', '', cand, flags=re.IGNORECASE).strip()
+        clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', cand).strip('-')
+        clean = re.sub(r'-+', '-', clean)
+        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push', 'repo', 'repository', 'github']:
+            return clean
+
+    # 5. '<name> (?:repo|repository|github)' e.g. 'Create a rapport extension GitHub.'
+    m_trail = re.search(r'(?:create|created|make|new)\s+(?:a\s+)?([a-zA-Z0-9_\-\s]+?)\s+(?:github|repo|repository)(?:\s+(?:and|please|sir)|\.|$)', text, re.IGNORECASE)
+    if m_trail:
+        cand = m_trail.group(1).strip()
+        clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', cand).strip('-')
+        clean = re.sub(r'-+', '-', clean)
+        if clean and clean.lower() not in ['new', 'a', 'the', 'my', 'and', 'push', 'repo', 'repository', 'github']:
             return clean
 
     return default
@@ -535,15 +838,53 @@ def extract_repo_name(t: str, default: str = "project-repo") -> str:
 def build_default_intent(transcript: str) -> dict:
     target_repo = get_target_repo()
     proj_name = get_project_name(target_repo)
+    # 0. Emergency Stop Intent (Immediate Priority)
+    if is_stop_intent(transcript):
+        return {
+            "type": "stop_action",
+            "action": "stop",
+            "target_file": "",
+            "task_description": "Stop all speech and operations",
+            "command": "python speak.py --stop",
+            "speaking_start": "",
+            "speaking_progress": "",
+            "speaking_response": "",
+        }
+
+    # 0b. Active Pending Confirmation Check (Yes / No)
+    pending_conf = check_pending_confirmation(transcript)
+    if pending_conf:
+        return pending_conf
+
     cd_prefix = f'cd "{target_repo}"'
     t = transcript.lower()
 
     # 1. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent (Immediate Priority)
     if is_antigravity_intent(transcript):
         target_file = extract_target_file(transcript)
-        target_path = os.path.join(target_repo, target_file)
+        target_path = os.path.join(target_repo, target_file) if target_file else ""
 
-        valid, full_tb, line_num, err_details = check_python_syntax(target_path)
+        # Retrieve recent error context from status cache if available
+        last_err_context = ""
+        try:
+            if os.path.exists(STATUS_CACHE_FILE):
+                with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as sf:
+                    st_content = sf.read().strip()
+                    if any(ew in st_content.lower() for ew in ["error", "fail", "defect", "exception"]):
+                        last_err_context = st_content
+        except Exception:
+            pass
+
+        if any(w in t for w in ["debug", "troubleshoot", "diagnose"]):
+            action = "debug"
+        elif "refactor" in t:
+            action = "refactor"
+        elif any(w in t for w in ["generate", "create", "write", "make", "build", "create app"]):
+            action = "code_generation"
+        else:
+            action = "bug_fix"
+
+        valid, full_tb, line_num, err_details = check_python_syntax(target_path) if target_path and os.path.exists(target_path) else (True, "", None, "")
         if not valid:
             action = "bug_fix"
             if line_num:
@@ -553,14 +894,15 @@ def build_default_intent(transcript: str) -> dict:
                 speaking_response = f"Syntax error detected in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
                 task_desc = f"@{target_file} Fix the compilation error: {err_details}. Resolve this issue now."
         else:
-            if "refactor" in t:
-                action = "refactor"
-            elif any(w in t for w in ["generate", "create", "write", "make", "build", "create app"]):
-                action = "code_generation"
+            if action == "debug":
+                speaking_response = f"Dispatched debug directive to Antigravity Agent, sir. Investigating the issue now."
+                task_desc = f"Debug and resolve the issue: {transcript}." + (f" Recent error context: {last_err_context}" if last_err_context else "")
+            elif action == "code_generation":
+                speaking_response = f"Delegating code generation for {target_file or 'tool'} to Antigravity Agent, sir."
+                task_desc = transcript
             else:
-                action = "bug_fix"
-            speaking_response = f"Syntax check passed. No compilation errors found in {target_file}, sir."
-            task_desc = transcript
+                speaking_response = f"Delegating task to Antigravity Agent, sir. Inspecting {target_file or 'the workspace'}."
+                task_desc = transcript
 
         return {
             "type": "antigravity_task",
@@ -569,7 +911,7 @@ def build_default_intent(transcript: str) -> dict:
             "task_description": task_desc,
             "command": f'{cd_prefix} && python execute_agent.py antigravity_task.json',
             "speaking_start": "Delegating task to Antigravity Agent, sir.",
-            "speaking_progress": f"Antigravity is checking {target_file}...",
+            "speaking_progress": f"Antigravity is checking {target_file or 'the project'}...",
             "speaking_response": speaking_response,
         }
 
@@ -588,57 +930,128 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": speaking_resp,
         }
 
-    # 3. Branch Deletion Intent (git branch -D <branch> && git push origin --delete <branch>)
+    # 3. Branch Deletion Intent (Requires Explicit User Confirmation)
     if is_branch_deletion(transcript):
         bname = extract_branch_name(transcript)
+        if bname in ["main", "master"]:
+            return {
+                "type": "general_qa",
+                "action": "",
+                "target_file": "",
+                "task_description": "Protected branch deletion rejected",
+                "command": "",
+                "speaking_start": "",
+                "speaking_progress": "",
+                "speaking_response": f"Cannot delete protected default branch {bname}, sir.",
+            }
+
+        # Store pending confirmation state
+        try:
+            with open(CONFIRMATION_CACHE_FILE, "w", encoding="utf-8") as cf:
+                json.dump({
+                    "action": "delete_branch",
+                    "branch_name": bname,
+                    "target_repo": target_repo,
+                    "timestamp": time.time(),
+                    "task_description": f"Delete branch {bname}"
+                }, cf, indent=2)
+            with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as sf:
+                sf.write(f"[CONFIRMATION REQUIRED] Delete branch '{bname}'? Say YES to confirm or NO to cancel.")
+        except Exception as e:
+            print(f"[intent_router.py] Confirmation cache notice: {e}", file=sys.stderr)
+
         return {
-            "type": "git_action",
+            "type": "confirm_action",
             "action": "delete_branch",
+            "branch_name": bname,
             "target_file": "",
-            "task_description": f"Delete branch {bname}",
-            "command": (
-                f'{cd_prefix} && git branch -D {bname} && git push origin --delete {bname}'
-            ),
-            "speaking_start": f"Deleting branch {bname} locally and from GitHub, sir.",
+            "task_description": f"Confirm deletion of branch {bname}",
+            "command": "",
+            "speaking_start": "",
             "speaking_progress": "",
-            "speaking_response": f"Branch {bname} has been deleted successfully, sir.",
+            "speaking_response": f"Are you sure you want to remove the {bname} branch, sir? Please say yes to confirm or no to cancel.",
+            "requires_confirmation": True
         }
 
-    # 4. Branch Creation & Push Intent (Strict command: git checkout -b <branch> && git push -u origin <branch>)
+    # 3b. Revert Last Commit Intent (Undo Committed Changes)
+    if is_revert_commit(transcript):
+        return {
+            "type": "git_action",
+            "action": "revert_commit",
+            "target_file": "",
+            "task_description": "Revert last committed changes",
+            "command": f'{cd_prefix} && python execute_git.py --revert-commit',
+            "speaking_start": "Reverting the last committed changes, sir.",
+            "speaking_progress": "Undoing the last commit and syncing repository...",
+            "speaking_response": "The last committed changes have been reverted successfully, sir.",
+        }
+
+    # 4. Branch Creation Intent
     if is_branch_creation(transcript):
         bname = extract_branch_name(transcript)
         return {
             "type": "git_action",
             "action": "create_branch",
             "target_file": "",
-            "task_description": f"Create and push branch {bname}",
+            "task_description": f"Create branch {bname}",
             "command": (
-                f'{cd_prefix} && git checkout -b {bname} && git push -u origin {bname}'
+                f'{cd_prefix} && (git checkout -b {bname} 2>nul || git checkout {bname}) && git push -u origin {bname}'
             ),
-            "speaking_start": f"Creating and pushing branch {bname} to GitHub, sir.",
+            "speaking_start": f"Creating branch {bname}, sir.",
             "speaking_progress": "",
-            "speaking_response": f"Branch {bname} has been created and pushed to GitHub, sir.",
+            "speaking_response": f"Branch {bname} has been created successfully, sir.",
         }
 
-    # 5. Repository Creation & Push Intent (Dedicated Handler)
+    # 5. Repository Creation Intent (Dedicated Handler)
     if is_repo_creation(transcript):
         repo_name = extract_repo_name(transcript, default=proj_name)
+        if any(w in t for w in ["and push", "push code", "push files"]):
+            return {
+                "type": "git_action",
+                "action": "create_repo_and_push",
+                "target_file": repo_name,
+                "task_description": f"Create GitHub repository {repo_name} and push code",
+                "command": f'{cd_prefix} && gh repo create {repo_name} --public --source=. --remote=origin --push',
+                "speaking_start": f"Creating new GitHub repository {repo_name} and pushing workspace files, sir.",
+                "speaking_progress": "",
+                "speaking_response": f"Repository {repo_name} has been created on GitHub and files pushed successfully, sir.",
+            }
         return {
             "type": "git_action",
             "action": "create_repo",
             "target_file": repo_name,
-            "task_description": f"Create GitHub repository {repo_name} and push all files",
-            "command": f'{cd_prefix} && gh repo create {repo_name} --public --source=. --remote=origin --push',
-            "speaking_start": f"Creating new GitHub repository {repo_name} and pushing workspace files, sir.",
+            "task_description": f"Create GitHub repository {repo_name}",
+            "command": f'{cd_prefix} && gh repo create {repo_name} --public',
+            "speaking_start": f"Creating new GitHub repository {repo_name}, sir.",
             "speaking_progress": "",
-            "speaking_response": f"Repository {repo_name} has been created on GitHub and files pushed successfully, sir.",
+            "speaking_response": f"Repository {repo_name} has been created on GitHub successfully, sir.",
         }
 
-    # 6. Standard Git Commit & Push Intent
-    if any(w in t for w in ["push", "commit", "repo", "github"]):
+    # 6. Push Code Intent (Dedicated Handler)
+    if is_push_code(transcript):
+        repo_name = extract_repo_name(transcript, default="")
+        spk_start = f"Pushing code to repository {repo_name}, sir." if repo_name else "Pushing code to GitHub, sir."
+        spk_resp = f"Code has been pushed to repository {repo_name} successfully, sir." if repo_name else "Code has been pushed to GitHub successfully, sir."
         return {
             "type": "git_action",
-            "action": "",
+            "action": "push_code",
+            "target_file": repo_name,
+            "task_description": f"Push code to repo {repo_name}" if repo_name else "Push code to GitHub",
+            "command": (
+                f'{cd_prefix} && git add -A && '
+                f'(git commit -m "Automated update via Jarvis" || echo "No changes to commit") && '
+                f'git push'
+            ),
+            "speaking_start": spk_start,
+            "speaking_progress": "",
+            "speaking_response": spk_resp,
+        }
+
+    # 7. Standard Git Commit & Push Fallback
+    if any(w in t for w in ["push", "commit"]):
+        return {
+            "type": "git_action",
+            "action": "push_code",
             "target_file": "",
             "task_description": "Git commit and push",
             "command": (
@@ -722,6 +1135,19 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
     req_type = str(data.get("type", "general_qa")).strip()
     cmd = str(data.get("command", "")).strip()
 
+    # STRICT OVERRIDE: Emergency stop command
+    if is_stop_intent(transcript):
+        return build_default_intent(transcript)
+
+    # STRICT OVERRIDE: Check active branch deletion confirmation first
+    pending_conf = check_pending_confirmation(transcript)
+    if pending_conf:
+        return pending_conf
+
+    # STRICT OVERRIDE: Branch deletion ALWAYS requires confirmation
+    if is_branch_deletion(transcript):
+        return build_default_intent(transcript)
+
     # STRICT OVERRIDE: Force git_query if the transcript is an informational git question
     if is_git_query(transcript):
         req_type = "git_query"
@@ -731,6 +1157,10 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
     # STRICT OVERRIDE: Force antigravity_task if any trigger keywords are in the transcript
     if is_antigravity_intent(transcript):
         req_type = "antigravity_task"
+
+    # STRICT OVERRIDE: Force git_action if branch creation, repo creation, or push code
+    if is_branch_creation(transcript) or is_repo_creation(transcript) or is_push_code(transcript):
+        req_type = "git_action"
 
     target_file = str(data.get("target_file", "")).strip()
     if req_type == "antigravity_task" and not target_file:
@@ -750,8 +1180,10 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
 
     if req_type == "antigravity_task":
         action = str(data.get("action", "bug_fix")).strip() or "bug_fix"
-        target_path = os.path.join(PROJECT_ROOT, target_file)
-        valid, full_tb, line_num, err_details = check_python_syntax(target_path)
+        if any(w in transcript.lower() for w in ["debug", "troubleshoot", "diagnose"]):
+            action = "debug"
+        target_path = os.path.join(PROJECT_ROOT, target_file) if target_file else ""
+        valid, full_tb, line_num, err_details = check_python_syntax(target_path) if target_path and os.path.exists(target_path) else (True, "", None, "")
         if not valid:
             action = "bug_fix"
             if line_num:
@@ -760,8 +1192,11 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
             else:
                 speaking_resp = f"Syntax error detected in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
                 task_desc = f"@{target_file} Fix the compilation error: {err_details}. Resolve this issue now."
+        elif action == "debug":
+            speaking_resp = f"Dispatched debug directive to Antigravity Agent, sir. Investigating the issue now."
+            task_desc = str(data.get("task_description", transcript)).strip()
         elif not speaking_resp or speaking_resp.startswith("Task completed"):
-            speaking_resp = f"Syntax check passed. No compilation errors found in {target_file}, sir."
+            speaking_resp = f"Delegating task to Antigravity Agent, sir. Inspecting {target_file or 'the workspace'}."
             task_desc = str(data.get("task_description", transcript)).strip()
         else:
             task_desc = str(data.get("task_description", transcript)).strip()
@@ -799,23 +1234,68 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
             "speaking_response": speaking_resp,
         }
 
-    if req_type == "git_action":
-        if is_branch_creation(transcript):
-            bname = extract_branch_name(transcript)
-            cmd = f'{cd_prefix} && git checkout -b {bname} && git push -u origin {bname}'
-            start = f"Creating and pushing branch {bname} to GitHub, sir."
-            speaking_resp = f"Branch {bname} has been created and pushed to GitHub, sir."
-        elif not cmd.startswith("cd "):
-            cmd = f'{cd_prefix} && {cmd}' if cmd else f'{cd_prefix} && git status'
-
+    action_val = str(data.get("action", "")).strip()
+    task_desc = str(data.get("task_description", "")).strip()
     start = clean_spoken_text(str(data.get("speaking_start", "")))
     prog = clean_spoken_text(str(data.get("speaking_progress", "")))
 
+    if req_type == "git_action":
+        if is_branch_deletion(transcript):
+            action_val = "delete_branch"
+            bname = extract_branch_name(transcript)
+            cmd = f'{cd_prefix} && git branch -D {bname} && git push origin --delete {bname}'
+            start = f"Deleting branch {bname} locally and from GitHub, sir."
+            speaking_resp = f"Branch {bname} has been deleted successfully, sir."
+            task_desc = f"Delete branch {bname}"
+            target_file = ""
+        elif is_branch_creation(transcript):
+            action_val = "create_branch"
+            bname = extract_branch_name(transcript)
+            cmd = f'{cd_prefix} && (git checkout -b {bname} 2>nul || git checkout {bname}) && git push -u origin {bname}'
+            start = f"Creating branch {bname}, sir."
+            speaking_resp = f"Branch {bname} has been created successfully, sir."
+            task_desc = f"Create branch {bname}"
+            target_file = ""
+        elif is_repo_creation(transcript):
+            target_name = extract_repo_name(transcript, default=get_project_name(get_target_repo()))
+            target_file = target_name
+            if any(w in transcript.lower() for w in ["and push", "push code", "push files"]):
+                action_val = "create_repo_and_push"
+                cmd = f'{cd_prefix} && gh repo create {target_name} --public --source=. --remote=origin --push'
+                start = f"Creating new GitHub repository {target_name} and pushing workspace files, sir."
+                speaking_resp = f"Repository {target_name} has been created on GitHub and files pushed successfully, sir."
+                task_desc = f"Create GitHub repository {target_name} and push code"
+            else:
+                action_val = "create_repo"
+                cmd = f'{cd_prefix} && gh repo create {target_name} --public'
+                start = f"Creating new GitHub repository {target_name}, sir."
+                speaking_resp = f"Repository {target_name} has been created on GitHub, sir."
+                task_desc = f"Create GitHub repository {target_name}"
+        elif is_push_code(transcript):
+            action_val = "push_code"
+            target_name = extract_repo_name(transcript, default="")
+            target_file = target_name
+            cmd = f'{cd_prefix} && git add -A && (git commit -m "Automated update via Jarvis" || echo "No changes to commit") && git push'
+            start = f"Pushing code to repository {target_name}, sir." if target_name else "Pushing code to GitHub, sir."
+            speaking_resp = f"Code has been pushed to repository {target_name} successfully, sir." if target_name else "Code has been pushed to GitHub successfully, sir."
+        elif is_revert_commit(transcript):
+            action_val = "revert_commit"
+            cmd = f'{cd_prefix} && python execute_git.py --revert-commit'
+            start = "Reverting the last committed changes, sir."
+            speaking_resp = "The last committed changes have been reverted successfully, sir."
+            task_desc = "Revert last committed changes"
+            target_file = ""
+        else:
+            if not cmd.startswith("cd "):
+                cmd = f'{cd_prefix} && {cmd}' if cmd else f'{cd_prefix} && git status'
+            if not start:
+                start = "Executing Git task, sir."
+
     return {
         "type": req_type,
-        "action": str(data.get("action", "")),
-        "target_file": str(data.get("target_file", "")),
-        "task_description": str(data.get("task_description", "")),
+        "action": action_val,
+        "target_file": target_file,
+        "task_description": task_desc,
         "command": cmd,
         "speaking_start": start,
         "speaking_progress": prog,
@@ -895,12 +1375,25 @@ def route_intent(transcript: str) -> dict:
     if not cleaned or len(cleaned) < 2:
         return build_default_intent(cleaned)
 
+    # 0a. IMMEDIATE ROUTING: Active pending confirmation check (Yes / No)
+    pending_res = check_pending_confirmation(cleaned)
+    if pending_res:
+        return pending_res
+
+    # 0. IMMEDIATE ROUTING: Emergency stop commands ('jarvis stop', 'stop', 'be quiet')
+    if is_stop_intent(cleaned):
+        return build_default_intent(cleaned)
+
     # 1. IMMEDIATE ROUTING: Git informational queries
     if is_git_query(cleaned):
         return build_default_intent(cleaned)
 
     # 2. IMMEDIATE ROUTING: Git branch deletion
     if is_branch_deletion(cleaned):
+        return build_default_intent(cleaned)
+
+    # 2b. IMMEDIATE ROUTING: Git revert last commit / undo committed changes
+    if is_revert_commit(cleaned):
         return build_default_intent(cleaned)
 
     # 3. IMMEDIATE ROUTING: Git branch creation & remote push
@@ -947,7 +1440,12 @@ def main():
     # Save to status & intent cache
     try:
         with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as f:
-            status_text = result.get("speaking_start") or f"Jarvis routing: {result.get('type')}"
+            if result.get("type") == "confirm_action":
+                status_text = f"[CONFIRMATION REQUIRED] Delete branch '{result.get('branch_name')}'? Say YES to confirm or NO to cancel."
+            elif "cancelled" in result.get("task_description", "").lower():
+                status_text = f"[CANCELLED] {result.get('speaking_response')}"
+            else:
+                status_text = result.get("speaking_start") or f"Jarvis routing: {result.get('type')}"
             f.write(status_text)
     except Exception as e:
         print(f"[intent_router.py] Status caching notice: {e}", file=sys.stderr)
@@ -976,7 +1474,7 @@ def main():
                     ANTIGRAVITY AUTONOMOUS TASK DISPATCH
 ================================================================================
 ACTION      : {action.upper()}
-TARGET FILE : {target_f}
+TARGET FILE : {target_f or "Project Workspace"}
 TIMESTAMP   : {time.strftime('%Y-%m-%d %H:%M:%S')}
 WORKSPACE   : {PROJECT_ROOT}
 
@@ -984,12 +1482,12 @@ TASK SPECIFICATION:
 {task_desc}
 
 DIRECTIVE:
-1. Inspect {target_f} and project workspace context.
-2. Execute requested code changes, bug fix, or feature scaffolding.
-3. Verify syntax and report status.
+1. Investigate the requested {action.replace('_', ' ')} in {target_f or "the workspace"}.
+2. Check relevant files, error logs, and system behavior.
+3. Formulate the resolution, apply code changes, and verify execution.
 ================================================================================
 """
-            hud_status = f"[SYNTAX OK] No compilation errors found in {target_f}."
+            hud_status = f"[ANTIGRAVITY ACTIVE] {action.upper()}: {task_desc[:50]}"
 
         try:
             with open(ANTIGRAVITY_PROMPT_FILE, "w", encoding="utf-8") as f:

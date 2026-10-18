@@ -107,21 +107,22 @@ def main():
         sys.exit(1)
 
     action = task.get("action", "bug_fix")
-    target_rel = task.get("target_file", "custom_tool.py")
+    target_rel = task.get("target_file", "").strip()
     task_desc = task.get("task_description", "")
-    speaking_prog = task.get("speaking_progress", f"Antigravity is reading {target_rel} and applying code patches...")
-    speaking_resp = task.get("speaking_response", f"Task completed, sir. Antigravity has resolved the issue in {target_rel}.")
+    target_display = target_rel or "Project Workspace"
+    speaking_prog = task.get("speaking_progress", f"Antigravity is inspecting {target_display}...")
+    speaking_resp = task.get("speaking_response", f"Task delegated to Antigravity Agent, sir.")
 
     target_repo = get_target_repo()
-    target_path = os.path.join(target_repo, target_rel)
+    target_path = os.path.join(target_repo, target_rel) if target_rel else ""
 
     # 1. Announce progress
-    append_hud_log(f"[ANTIGRAVITY] Initialized bridge for: {target_rel} (Action: {action})")
+    append_hud_log(f"[ANTIGRAVITY] Initialized bridge for: {target_display} (Action: {action})")
     speak_async(speaking_prog)
 
     # 2. Update task status in JSON
     task["status"] = "in_progress"
-    task["current_step"] = "Analyzing AST tree"
+    task["current_step"] = "Analyzing context & delegating"
     try:
         with open(task_path, "w", encoding="utf-8") as f:
             json.dump(task, f, indent=2)
@@ -130,32 +131,35 @@ def main():
 
     time.sleep(0.3)
 
-    # 3. Analyze AST & File
-    append_hud_log(f"[ANTIGRAVITY] Reading AST tree & inspecting syntax in {target_rel}...")
-    if not os.path.exists(target_path):
-        if action == "code_generation":
-            append_hud_log(f"[ANTIGRAVITY] Target does not exist. Synthesizing new module scaffold...")
-            code = generate_scaffold(target_rel, task_desc)
-            with open(target_path, "w", encoding="utf-8") as f:
-                f.write(code)
-            append_hud_log(f"[ANTIGRAVITY] Module scaffold created: {target_rel}")
-        else:
-            append_hud_log(f"[ANTIGRAVITY] Notice: Target file {target_rel} not found. Creating placeholder.")
-            with open(target_path, "w", encoding="utf-8") as f:
-                f.write(generate_scaffold(target_rel, task_desc))
+    # 3. Analyze AST & File if a specific file is targeted
+    if target_rel and target_path:
+        append_hud_log(f"[ANTIGRAVITY] Reading AST tree & inspecting syntax in {target_rel}...")
+        if not os.path.exists(target_path):
+            if action == "code_generation":
+                append_hud_log(f"[ANTIGRAVITY] Target does not exist. Synthesizing new module scaffold...")
+                code = generate_scaffold(target_rel, task_desc)
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                append_hud_log(f"[ANTIGRAVITY] Module scaffold created: {target_rel}")
+            else:
+                append_hud_log(f"[ANTIGRAVITY] Notice: Target file {target_rel} not found. Creating placeholder.")
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(generate_scaffold(target_rel, task_desc))
+        elif os.path.isfile(target_path):
+            # File exists: verify AST parse
+            try:
+                with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+                    source = f.read()
+                tree = ast.parse(source)
+                append_hud_log(f"[ANTIGRAVITY] AST validation parsed {len(tree.body)} root nodes in {target_rel}.")
+                append_hud_log(f"[ANTIGRAVITY] Inspecting dependencies and applying patches...")
+            except SyntaxError as se:
+                append_hud_log(f"[ANTIGRAVITY] Syntax defect detected in {target_rel} at line {se.lineno}: {se.msg}")
+                append_hud_log(f"[ANTIGRAVITY] Applying patch repair...")
     else:
-        # File exists: verify AST parse
-        try:
-            with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
-                source = f.read()
-            tree = ast.parse(source)
-            append_hud_log(f"[ANTIGRAVITY] AST validation parsed {len(tree.body)} root nodes in {target_rel}.")
-            append_hud_log(f"[ANTIGRAVITY] Applying diff patches and resolving dependencies...")
-        except SyntaxError as se:
-            append_hud_log(f"[ANTIGRAVITY] Syntax defect detected in {target_rel} at line {se.lineno}: {se.msg}")
-            append_hud_log(f"[ANTIGRAVITY] Applying patch repair...")
+        append_hud_log(f"[ANTIGRAVITY] Inspecting project workspace context...")
 
-    time.sleep(0.4)
+    time.sleep(0.3)
 
     # Ensure prompt is dispatched to Antigravity IDE agent if not already dispatched
     prompt = task.get("prompt") or task_desc or f"Inspect and fix {target_rel}"
@@ -169,7 +173,19 @@ def main():
         except Exception as e:
             append_hud_log(f"[ANTIGRAVITY] Dispatch error: {e}")
 
-    # 4. Syntax Verification
+    # 4. Delegation and Verification
+    if action in ["debug", "bug_fix"]:
+        append_hud_log(f"[ANTIGRAVITY] Task successfully delegated to Antigravity Agent.")
+        task["status"] = "dispatched"
+        task["current_step"] = "Antigravity Agent is investigating the issue"
+        try:
+            with open(task_path, "w", encoding="utf-8") as f:
+                json.dump(task, f, indent=2)
+        except Exception:
+            pass
+        append_hud_log(f"[ANTIGRAVITY] Directive handed over to Antigravity Agent.")
+        sys.exit(0)
+
     append_hud_log(f"[ANTIGRAVITY] Checking current syntax status in {target_rel}...")
     valid, err_msg = compile_check(target_path)
 

@@ -27,7 +27,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// src/extension.ts
+// extension/src/extension.ts
 var extension_exports = {};
 __export(extension_exports, {
   activate: () => activate,
@@ -36,7 +36,7 @@ __export(extension_exports, {
 module.exports = __toCommonJS(extension_exports);
 var vscode6 = __toESM(require("vscode"));
 
-// src/secretManager.ts
+// extension/src/secretManager.ts
 var vscode = __toESM(require("vscode"));
 var fs = __toESM(require("fs"));
 var path = __toESM(require("path"));
@@ -46,6 +46,8 @@ var SecretManager = class {
     this.context = context;
     this.coreDir = coreDir;
   }
+  context;
+  coreDir;
   /**
    * Retrieves the Groq API key from VS Code SecretStorage, falling back to core .env.
    */
@@ -159,7 +161,7 @@ GROQ_API_KEY=${key}
   }
 };
 
-// src/n8nService.ts
+// extension/src/n8nService.ts
 var vscode2 = __toESM(require("vscode"));
 var http = __toESM(require("http"));
 var path2 = __toESM(require("path"));
@@ -170,6 +172,8 @@ var N8nService = class {
     this.coreDir = coreDir;
     this.n8nUrl = n8nUrl;
   }
+  coreDir;
+  n8nUrl;
   isOnline = false;
   checkInterval = null;
   onStatusChangeEmitter = new vscode2.EventEmitter();
@@ -277,7 +281,7 @@ var N8nService = class {
   }
 };
 
-// src/processManager.ts
+// extension/src/processManager.ts
 var vscode3 = __toESM(require("vscode"));
 var path3 = __toESM(require("path"));
 var cp2 = __toESM(require("child_process"));
@@ -286,6 +290,7 @@ var ProcessManager = class {
   constructor(coreDir) {
     this.coreDir = coreDir;
   }
+  coreDir;
   listenerTerminal = null;
   /**
    * Resolves the current active workspace directory.
@@ -342,16 +347,36 @@ var ProcessManager = class {
     );
   }
   /**
-   * Stops the active voice listener terminal.
+   * Stops active speech playback and the voice listener.
    */
   stopVoiceListener() {
+    const ws = this.getActiveWorkspace();
+    const pyCmd = this.getPythonCmd();
+    let speakScript = path3.join(this.coreDir, "speak.py");
+    if (fs3.existsSync(path3.join(ws, "speak.py"))) {
+      speakScript = path3.join(ws, "speak.py");
+    }
+    try {
+      cp2.exec(`${pyCmd} "${speakScript}" --stop`, { cwd: ws });
+    } catch {
+    }
+    try {
+      fs3.writeFileSync(path3.join(this.coreDir, "jarvis_stop.flag"), String(Date.now()), "utf-8");
+      fs3.writeFileSync(path3.join(this.coreDir, "last_status.txt"), "[STOPPED] Jarvis halted by user.", "utf-8");
+      if (ws !== this.coreDir) {
+        fs3.writeFileSync(path3.join(ws, "jarvis_stop.flag"), String(Date.now()), "utf-8");
+      }
+    } catch {
+    }
+    let hadTerminal = false;
     if (this.listenerTerminal) {
       this.listenerTerminal.dispose();
       this.listenerTerminal = null;
-      vscode3.window.showInformationMessage("Jarvis: Voice Listener terminated.");
-    } else {
-      vscode3.window.showInformationMessage("Jarvis: Voice Listener is not running.");
+      hadTerminal = true;
     }
+    vscode3.window.showInformationMessage(
+      hadTerminal ? "Jarvis: Voice Listener terminated and speech halted." : "Jarvis: Speech halted and systems silenced."
+    );
   }
   /**
    * Spawns the native PyQt6 Sci-Fi holographic HUD window independently.
@@ -406,7 +431,7 @@ var ProcessManager = class {
   }
 };
 
-// src/statusBar.ts
+// extension/src/statusBar.ts
 var vscode4 = __toESM(require("vscode"));
 var path4 = __toESM(require("path"));
 var StatusBarManager = class {
@@ -426,6 +451,9 @@ var StatusBarManager = class {
     this.updateDisplay();
     this.statusBarItem.show();
   }
+  context;
+  n8nService;
+  processManager;
   statusBarItem;
   updateDisplay() {
     const ws = this.processManager.getActiveWorkspace();
@@ -504,10 +532,11 @@ var StatusBarManager = class {
   }
 };
 
-// src/hudViewProvider.ts
+// extension/src/hudViewProvider.ts
 var vscode5 = __toESM(require("vscode"));
 var fs4 = __toESM(require("fs"));
 var path5 = __toESM(require("path"));
+var cp3 = __toESM(require("child_process"));
 var HudViewProvider = class {
   constructor(context, coreDir, n8nService2, processManager) {
     this.context = context;
@@ -515,6 +544,10 @@ var HudViewProvider = class {
     this.n8nService = n8nService2;
     this.processManager = processManager;
   }
+  context;
+  coreDir;
+  n8nService;
+  processManager;
   static viewType = "jarvis-hud-view";
   _view;
   resolveWebviewView(webviewView, _context, _token) {
@@ -529,6 +562,7 @@ var HudViewProvider = class {
         case "startListener":
           vscode5.commands.executeCommand("jarvis.start");
           break;
+        case "stopJarvis":
         case "stopListener":
           vscode5.commands.executeCommand("jarvis.stop");
           break;
@@ -544,6 +578,15 @@ var HudViewProvider = class {
         case "initProject":
           vscode5.commands.executeCommand("jarvis.initProject");
           break;
+        case "requestDeleteBranch":
+          await this.promptForBranchDeletion();
+          break;
+        case "revertCommit":
+          await this.promptAndRevertCommit();
+          break;
+        case "confirmBranch":
+          await this.handleBranchConfirmation(message.choice, message.branchName);
+          break;
         case "refresh":
           this.sendTelemetryUpdate();
           break;
@@ -556,7 +599,7 @@ var HudViewProvider = class {
       if (this._view?.visible) {
         this.sendTelemetryUpdate();
       }
-    }, 2e3);
+    }, 1500);
     this.context.subscriptions.push({
       dispose: () => clearInterval(telemetryTimer)
     });
@@ -570,19 +613,86 @@ var HudViewProvider = class {
     const n8nOnline = this.n8nService.getStatus();
     let lastTranscript = "Standing by for wake word 'Hey Jarvis'...";
     let lastStatus = "Systems normal. Ready for commands.";
+    let pendingConfirmation = null;
     try {
-      const transFile = path5.join(this.coreDir, "last_transcript.txt");
-      if (fs4.existsSync(transFile)) {
-        const text = fs4.readFileSync(transFile, "utf-8").trim();
-        if (text) {
-          lastTranscript = text;
+      const transFiles = [
+        path5.join(this.coreDir, "last_transcript.txt"),
+        path5.join(ws, "last_transcript.txt")
+      ];
+      for (const tf of transFiles) {
+        if (fs4.existsSync(tf)) {
+          const text = fs4.readFileSync(tf, "utf-8").trim();
+          if (text) {
+            lastTranscript = text;
+            break;
+          }
         }
       }
-      const statusFile = path5.join(this.coreDir, "last_status.txt");
-      if (fs4.existsSync(statusFile)) {
-        const sText = fs4.readFileSync(statusFile, "utf-8").trim();
-        if (sText) {
-          lastStatus = sText;
+      const statusFiles = [
+        path5.join(this.coreDir, "last_status.txt"),
+        path5.join(ws, "last_status.txt")
+      ];
+      for (const sf of statusFiles) {
+        if (fs4.existsSync(sf)) {
+          const sText = fs4.readFileSync(sf, "utf-8").trim();
+          if (sText) {
+            lastStatus = sText;
+            break;
+          }
+        }
+      }
+      const confFiles = [
+        path5.join(this.coreDir, "pending_confirmation.json"),
+        path5.join(ws, "pending_confirmation.json")
+      ];
+      for (const cf of confFiles) {
+        if (fs4.existsSync(cf)) {
+          try {
+            const cText = fs4.readFileSync(cf, "utf-8").trim();
+            if (cText) {
+              const cData = JSON.parse(cText);
+              const nowSec = Date.now() / 1e3;
+              const ts = cData.timestamp || nowSec;
+              if (nowSec - ts < 180 && cData.action === "delete_branch" && cData.branch_name) {
+                pendingConfirmation = {
+                  action: cData.action,
+                  branchName: cData.branch_name
+                };
+                break;
+              }
+            }
+          } catch {
+          }
+        }
+      }
+      if (!pendingConfirmation) {
+        const intentFiles = [
+          path5.join(this.coreDir, "last_intent.json"),
+          path5.join(ws, "last_intent.json")
+        ];
+        for (const ifile of intentFiles) {
+          if (fs4.existsSync(ifile)) {
+            try {
+              const iData = JSON.parse(fs4.readFileSync(ifile, "utf-8"));
+              if (iData && (iData.type === "confirm_action" || iData.requires_confirmation) && iData.branch_name) {
+                pendingConfirmation = {
+                  action: "delete_branch",
+                  branchName: iData.branch_name
+                };
+                break;
+              }
+            } catch {
+            }
+          }
+        }
+      }
+      if (!pendingConfirmation && lastStatus.includes("[CONFIRMATION REQUIRED]")) {
+        const match = lastStatus.match(/branch\s+['"]([^'"]+)['"]/i);
+        if (match && match[1]) {
+          pendingConfirmation = {
+            action: "delete_branch",
+            branchName: match[1]
+          };
         }
       }
     } catch {
@@ -593,8 +703,236 @@ var HudViewProvider = class {
       workspace: ws,
       n8nOnline,
       lastTranscript,
-      lastStatus
+      lastStatus,
+      pendingConfirmation
     });
+  }
+  async promptForBranchDeletion() {
+    const ws = this.processManager.getActiveWorkspace();
+    let branches = [];
+    try {
+      const out = cp3.execSync("git branch --list --no-color", { cwd: ws, encoding: "utf-8" });
+      branches = out.split("\n").map((b) => b.replace("*", "").trim()).filter((b) => b.length > 0 && b !== "main" && b !== "master");
+    } catch {
+    }
+    let selectedBranch;
+    if (branches.length > 0) {
+      selectedBranch = await vscode5.window.showQuickPick(branches, {
+        placeHolder: "Select a git branch to remove (or ESC to type custom branch)"
+      });
+    }
+    if (!selectedBranch) {
+      selectedBranch = await vscode5.window.showInputBox({
+        prompt: "Enter git branch name to remove",
+        placeHolder: "e.g. test, feature-ui"
+      });
+    }
+    if (!selectedBranch || !selectedBranch.trim()) {
+      return;
+    }
+    selectedBranch = selectedBranch.trim();
+    if (selectedBranch === "main" || selectedBranch === "master") {
+      vscode5.window.showErrorMessage(`Cannot delete protected branch '${selectedBranch}'.`);
+      return;
+    }
+    const confData = {
+      action: "delete_branch",
+      branch_name: selectedBranch,
+      target_repo: ws,
+      timestamp: Date.now() / 1e3,
+      task_description: `Delete branch ${selectedBranch}`
+    };
+    try {
+      fs4.writeFileSync(path5.join(this.coreDir, "pending_confirmation.json"), JSON.stringify(confData, null, 2), "utf-8");
+      if (ws !== this.coreDir) {
+        fs4.writeFileSync(path5.join(ws, "pending_confirmation.json"), JSON.stringify(confData, null, 2), "utf-8");
+      }
+      fs4.writeFileSync(
+        path5.join(this.coreDir, "last_status.txt"),
+        `[CONFIRMATION REQUIRED] Delete branch '${selectedBranch}'? Say YES to confirm or NO to cancel.`,
+        "utf-8"
+      );
+    } catch {
+    }
+    this.sendTelemetryUpdate();
+  }
+  async promptAndRevertCommit() {
+    const ws = this.processManager.getActiveWorkspace();
+    const confirm = await vscode5.window.showWarningMessage(
+      "Are you sure you want to revert the last committed changes?",
+      { modal: true },
+      "Yes, Revert",
+      "Cancel"
+    );
+    if (confirm !== "Yes, Revert") {
+      return;
+    }
+    const statusFiles = [
+      path5.join(this.coreDir, "last_status.txt"),
+      path5.join(ws, "last_status.txt")
+    ];
+    const transcriptFiles = [
+      path5.join(this.coreDir, "last_transcript.txt"),
+      path5.join(ws, "last_transcript.txt")
+    ];
+    const writeAll = (files, content) => {
+      for (const f of files) {
+        try {
+          fs4.writeFileSync(f, content, "utf-8");
+        } catch {
+        }
+      }
+    };
+    writeAll(transcriptFiles, "[SIDEBAR ACTION] User requested revert of last commit");
+    writeAll(statusFiles, "[EXECUTING] Reverting last commit and syncing repository...");
+    this.sendTelemetryUpdate();
+    const pyCmd = this.processManager.getPythonCmd();
+    let execScript = path5.join(this.coreDir, "execute_git.py");
+    if (!fs4.existsSync(execScript) && fs4.existsSync(path5.join(ws, "execute_git.py"))) {
+      execScript = path5.join(ws, "execute_git.py");
+    }
+    let speakScript = path5.join(this.coreDir, "speak.py");
+    if (!fs4.existsSync(speakScript) && fs4.existsSync(path5.join(ws, "speak.py"))) {
+      speakScript = path5.join(ws, "speak.py");
+    }
+    cp3.exec(
+      `${pyCmd} "${execScript}" --revert-commit`,
+      {
+        cwd: ws,
+        env: { ...process.env, TARGET_REPO_PATH: ws }
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          const rawErr = (stderr || stdout || err.message).replace(/\r?\n/g, " ");
+          writeAll(statusFiles, `[GIT ERROR] Failed to revert commit: ${rawErr.slice(0, 110)}`);
+          cp3.exec(`${pyCmd} "${speakScript}" "Failed to revert the last commit, sir."`, { cwd: ws });
+          vscode5.window.showErrorMessage("Jarvis: Failed to revert commit.");
+        } else {
+          writeAll(statusFiles, "[GIT SUCCESS] Last committed changes reverted successfully.");
+          cp3.exec(`${pyCmd} "${speakScript}" "The last committed changes have been reverted successfully, sir."`, {
+            cwd: ws
+          });
+          vscode5.window.showInformationMessage("Jarvis: Last committed changes reverted successfully.");
+        }
+        this.sendTelemetryUpdate();
+      }
+    );
+  }
+  async handleBranchConfirmation(choice, branchOverride) {
+    const ws = this.processManager.getActiveWorkspace();
+    let branchName = branchOverride || "test";
+    let targetRepo = ws;
+    const confFiles = [
+      path5.join(this.coreDir, "pending_confirmation.json"),
+      path5.join(ws, "pending_confirmation.json")
+    ];
+    for (const confFile of confFiles) {
+      if (fs4.existsSync(confFile)) {
+        try {
+          const data = JSON.parse(fs4.readFileSync(confFile, "utf-8"));
+          if (data.branch_name) {
+            branchName = data.branch_name;
+          }
+          if (data.target_repo && fs4.existsSync(data.target_repo)) {
+            targetRepo = data.target_repo;
+          }
+        } catch {
+        }
+        try {
+          fs4.unlinkSync(confFile);
+        } catch {
+        }
+      }
+    }
+    if (!branchName || branchName === "test") {
+      const statusFiles2 = [
+        path5.join(this.coreDir, "last_status.txt"),
+        path5.join(ws, "last_status.txt")
+      ];
+      for (const sf of statusFiles2) {
+        if (fs4.existsSync(sf)) {
+          const txt = fs4.readFileSync(sf, "utf-8");
+          const m = txt.match(/branch\s+['"]([^'"]+)['"]/i) || txt.match(/'([^']+)'/);
+          if (m && m[1]) {
+            branchName = m[1];
+            break;
+          }
+        }
+      }
+    }
+    const intentFiles = [
+      path5.join(this.coreDir, "last_intent.json"),
+      path5.join(ws, "last_intent.json")
+    ];
+    for (const ifile of intentFiles) {
+      if (fs4.existsSync(ifile)) {
+        try {
+          const iData = JSON.parse(fs4.readFileSync(ifile, "utf-8"));
+          if (iData.type === "confirm_action") {
+            fs4.unlinkSync(ifile);
+          }
+        } catch {
+        }
+      }
+    }
+    const pyCmd = this.processManager.getPythonCmd();
+    let execScript = path5.join(this.coreDir, "execute_git.py");
+    if (!fs4.existsSync(execScript) && fs4.existsSync(path5.join(ws, "execute_git.py"))) {
+      execScript = path5.join(ws, "execute_git.py");
+    }
+    let speakScript = path5.join(this.coreDir, "speak.py");
+    if (!fs4.existsSync(speakScript) && fs4.existsSync(path5.join(ws, "speak.py"))) {
+      speakScript = path5.join(ws, "speak.py");
+    }
+    const statusFiles = [
+      path5.join(this.coreDir, "last_status.txt"),
+      path5.join(ws, "last_status.txt")
+    ];
+    const transcriptFiles = [
+      path5.join(this.coreDir, "last_transcript.txt"),
+      path5.join(ws, "last_transcript.txt")
+    ];
+    const writeAll = (files, content) => {
+      for (const f of files) {
+        try {
+          fs4.writeFileSync(f, content, "utf-8");
+        } catch {
+        }
+      }
+    };
+    if (choice === "yes") {
+      writeAll(transcriptFiles, `[CONFIRMED] Delete branch '${branchName}'`);
+      writeAll(statusFiles, `[EXECUTING] Deleting branch '${branchName}' locally and from GitHub...`);
+      this.sendTelemetryUpdate();
+      cp3.exec(
+        `${pyCmd} "${execScript}" --delete-branch "${branchName}"`,
+        {
+          cwd: targetRepo,
+          env: { ...process.env, TARGET_REPO_PATH: targetRepo }
+        },
+        (err, stdout, stderr) => {
+          if (err) {
+            const rawErr = (stderr || stdout || err.message).replace(/\r?\n/g, " ");
+            writeAll(statusFiles, `[GIT ERROR] Failed to delete branch '${branchName}': ${rawErr.slice(0, 110)}`);
+            cp3.exec(`${pyCmd} "${speakScript}" "Failed to delete branch ${branchName}, sir."`, { cwd: targetRepo });
+            vscode5.window.showErrorMessage(`Jarvis: Failed to delete branch '${branchName}'`);
+          } else {
+            writeAll(statusFiles, `[GIT SUCCESS] Branch '${branchName}' deleted successfully.`);
+            cp3.exec(`${pyCmd} "${speakScript}" "Branch ${branchName} has been deleted successfully, sir."`, {
+              cwd: targetRepo
+            });
+            vscode5.window.showInformationMessage(`Jarvis: Branch '${branchName}' deleted successfully.`);
+          }
+          this.sendTelemetryUpdate();
+        }
+      );
+    } else {
+      writeAll(transcriptFiles, `[CANCELLED] Branch '${branchName}' deletion cancelled`);
+      writeAll(statusFiles, `[CANCELLED] Deletion of branch '${branchName}' cancelled by user.`);
+      cp3.exec(`${pyCmd} "${speakScript}" "Branch deletion cancelled, sir."`, { cwd: targetRepo });
+      vscode5.window.showInformationMessage(`Jarvis: Branch '${branchName}' deletion cancelled.`);
+      this.sendTelemetryUpdate();
+    }
   }
   getHtmlForWebview(_webview) {
     return `<!DOCTYPE html>
@@ -729,6 +1067,25 @@ var HudViewProvider = class {
       background: rgba(0, 255, 136, 0.3);
       box-shadow: 0 0 12px rgba(0, 255, 136, 0.6);
     }
+    button.btn-danger {
+      grid-column: span 2;
+      background: rgba(255, 68, 68, 0.15);
+      border-color: var(--red);
+      color: var(--red);
+    }
+    button.btn-danger:hover {
+      background: rgba(255, 68, 68, 0.35);
+      box-shadow: 0 0 12px rgba(255, 68, 68, 0.7);
+    }
+    button.btn-warn {
+      background: rgba(255, 157, 0, 0.15);
+      border-color: var(--amber);
+      color: var(--amber);
+    }
+    button.btn-warn:hover {
+      background: rgba(255, 157, 0, 0.35);
+      box-shadow: 0 0 12px rgba(255, 157, 0, 0.7);
+    }
   </style>
 </head>
 <body>
@@ -755,7 +1112,10 @@ var HudViewProvider = class {
   </div>
 
   <div class="btn-grid">
+    <button class="btn-warn" onclick="sendMessage('requestDeleteBranch')">\u{1F5D1}\uFE0F REMOVE BRANCH</button>
+    <button class="btn-warn" onclick="sendMessage('revertCommit')">\u21A9\uFE0F REVERT COMMIT</button>
     <button class="btn-primary" onclick="sendMessage('startListener')">\u{1F3A4} START VOICE LISTENER</button>
+    <button class="btn-danger" onclick="sendMessage('stopJarvis')">\u{1F6D1} STOP / SILENCE JARVIS</button>
     <button onclick="sendMessage('openDesktopHud')">\u{1F5A5}\uFE0F DESKTOP HUD</button>
     <button onclick="sendMessage('restartN8n')">\u{1F504} RESTART N8N</button>
     <button onclick="sendMessage('setGroqKey')">\u{1F511} SET GROQ KEY</button>
@@ -846,14 +1206,14 @@ var HudViewProvider = class {
   }
 };
 
-// src/extension.ts
+// extension/src/extension.ts
 var path6 = __toESM(require("path"));
 var fs5 = __toESM(require("fs"));
-var cp3 = __toESM(require("child_process"));
+var cp4 = __toESM(require("child_process"));
 var n8nService;
 function checkPythonDependencies(coreDir, processManager) {
   const pyCmd = processManager.getPythonCmd();
-  cp3.exec(`${pyCmd} -c "import PyQt6, openwakeword, edge_tts"`, (err) => {
+  cp4.exec(`${pyCmd} -c "import PyQt6, openwakeword, edge_tts"`, (err) => {
     if (err) {
       vscode6.window.showWarningMessage(
         "Jarvis: Python dependencies are missing on this system. Would you like to install them now?",
@@ -970,4 +1330,3 @@ function deactivate() {
   activate,
   deactivate
 });
-//# sourceMappingURL=extension.js.map

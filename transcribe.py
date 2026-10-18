@@ -47,7 +47,9 @@ def transcribe_with_groq(audio_path: str) -> str:
         data = {
             "model": "whisper-large-v3-turbo",
             "temperature": "0.0",
+            "language": "en",
             "response_format": "json",
+            "prompt": "Jarvis developer voice assistant for Git operations, software engineering, and workspace commands: create branch, testing, checkout, commit, push, revert, status, diff, repository, repo, Antigravity, GitHub, Python, code.",
         }
         response = requests.post(url, headers=headers, files=files, data=data, timeout=15)
 
@@ -64,9 +66,11 @@ def transcribe_with_faster_whisper(audio_path: str) -> str:
     model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
         audio_path,
+        language="en",
         beam_size=5,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
+        initial_prompt="Jarvis developer voice assistant for Git operations: create branch, testing, checkout, commit, push, revert, status, repository, repo.",
+        vad_parameters=dict(min_silence_duration_ms=300),
     )
     text_parts = [segment.text.strip() for segment in segments]
     return sanitize_transcript(" ".join(text_parts))
